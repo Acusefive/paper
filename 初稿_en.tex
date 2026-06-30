@@ -1,0 +1,885 @@
+\documentclass[a4paper,12pt]{article}
+
+\usepackage{geometry}
+\geometry{left=2.6cm,right=2.6cm,top=2.6cm,bottom=2.6cm}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,tabularx,array,makecell,multirow}
+\usepackage{graphicx}
+\usepackage{pdflscape}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage[round,authoryear]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+\usepackage[normalem]{ulem}
+\usepackage{svg}
+\numberwithin{table}{section}
+\renewcommand{\thetable}{\thesection-\arabic{table}}
+\renewcommand{\arraystretch}{1.18}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.25em}
+\sloppy
+
+\title{Target-Conditioned Cognitive Evidence Retrieval for Inductive Knowledge Tracing over Unseen Concepts}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Online learning platforms continually introduce new questions and knowledge concepts. As a result, test targets may involve concepts that are unseen during training, leaving knowledge tracing models that rely on question or concept identifiers without direct supervision signals. This paper proposes Cognitive-RAG KT, which retrieves transferable cognitive evidence from a student's pre-target history by using the target question as the query. The model builds a hierarchical cognitive context from question semantics, knowledge structure and collaborative behavior, and uses a structured cognitive summary to compress mastered concepts, weak concepts, transfer state and evidence quality. It then maps the student-side context, summary-derived features and target-question prior into soft slots, injects them into a frozen LLM, and computes the probability of a correct response from label logits. Experiments on MOOCRadar, XES3G5M and FoundationalASSIST show that Cognitive-RAG KT outperforms multiple KT baselines. Slice analysis and ablations further show that target-conditioned cognitive evidence retrieval provides the most stable gain in probability ranking, while structured evidence and structured cognitive summaries provide complementary support.
+\end{abstract}
+
+\noindent Keywords: knowledge tracing; unseen-concept inductive prediction; target-conditioned cognitive evidence retrieval; structured cognitive summary; frozen LLM
+
+\section{Introduction}
+
+Knowledge tracing (KT) estimates a student's knowledge state from prior learning interactions and predicts performance on later questions or learning activities. As a core capability of intelligent education systems, KT supports personalized practice recommendation, learning path planning and instructional intervention. Real platforms, however, do not keep their question banks, course content or knowledge organization fixed. New questions and knowledge concepts appear over time, and these concepts may not occur in the supervised interactions used for training. For target questions associated with unseen knowledge concepts, a model cannot directly rely on historical labels, question-ID statistics or concept embeddings for those concepts. It must therefore transfer from existing learning experience to new concept targets.
+
+Most traditional KT methods use question IDs, knowledge concept IDs or supervised representations of them as core inputs. BKT, DKT and DKVMN model student interaction histories through probabilistic graphs, recurrent networks or memory networks, while SAKT, SAINT and AKT use attention mechanisms to capture interaction dependencies\citep{corbett1995knowledge,piech2015deep,zhang2017dynamic,pandey2019sakt,choi2020saint,ghosh2020akt}. These methods can learn student states effectively when training and test data share the same question or concept distribution. When a test target involves an unseen knowledge concept, however, discrete identifiers and their parameterized representations have no direct learning basis. Recent work uses question text, concept semantics and structural relations to mitigate this problem\citep{fu2024sinkt}, but a finer question remains unresolved: for the same unseen concept target, which interactions in each student's history are truly transferable.
+
+Unseen-concept prediction cannot be solved by simply extending the history length. A student's history contains prerequisite support, semantic neighbors and structural relations that are closely related to the current target, but it also contains weakly related or redundant information. The same historical interaction may have different transfer value for different unseen targets. The central issue is therefore not how to feed more history into the model, but how to identify which pre-target interactions provide transferable evidence for the current unseen concept target.
+
+To address this issue, this paper proposes Cognitive-RAG KT. The model uses the current unseen-concept target question as the query, performs target-conditioned cognitive evidence retrieval over the student's pre-target history, and builds a hierarchical cognitive context from question semantics, knowledge concepts, cognitive attributes, knowledge structure and collaborative behavioral relations. A structured cognitive summary then compresses the retrieved evidence into constrained fields, including mastered concepts, weak concepts, transfer state, risk level and evidence quality. This summary does not generate prediction labels. Instead, it serves as part of the student-side context for probabilistic discrimination. The student-side context, summary-derived features and target-side prior are mapped into continuous soft slots, injected into the representation space of a frozen LLM, and used to compute the probability of a correct response through a binary softmax over label logits.
+
+This design adapts retrieval augmentation to target-conditioned evidence selection for cross-concept transfer. It does not rewrite the full history as a natural-language prompt, nor does it ask the LLM to make a free-form judgment. Experiments on three public datasets show stable gains. Ablation analysis further shows that target-conditioned cognitive evidence retrieval is the largest contributor to probability ranking, structured evidence provides secondary support, and structured cognitive summaries provide an auxiliary evidence-compression gain.
+
+This paper makes four contributions. First, it formulates an unseen-concept inductive KT evaluation protocol in which every test target is associated with at least one knowledge concept unseen during training. Under this protocol, the model must transfer from a student's experience on existing concepts to a target with unseen concept requirements. Second, it introduces a target-conditioned cognitive evidence retrieval mechanism that selects transferable interactions from the student's pre-target history and organizes them into a hierarchical cognitive context using question semantics, knowledge structure and collaborative behavioral relations. The same mechanism uses structured cognitive summaries to compactly represent mastered concepts, weak concepts, transfer state and evidence quality. Third, it designs a frozen-LLM soft-slot probability prediction module that maps the student-side context, summary-derived features and target-side prior into continuous conditional inputs, and estimates the probability of a correct response from label logits rather than free-text generation. Fourth, it evaluates Cognitive-RAG KT on MOOCRadar~\citep{yu2023moocradar}, XES3G5M~\citep{liu2023xes3g5m} and FoundationalASSIST~\citep{worden2026foundationalassist} under the unseen-concept inductive protocol, compares it with representative KT baselines, and analyzes the framework through retrieval controls and key-component ablations.
+
+\section{Related Work}
+
+\subsection{Traditional Knowledge Tracing and Unseen Knowledge Concept Prediction}
+
+Knowledge tracing (KT) estimates a student's knowledge state from historical learning behavior and predicts performance on subsequent questions. Early models, including BKT, item response theory and cognitive diagnosis models, describe student states through explicit skills, item parameters or latent variables\citep{corbett1995knowledge,chen2021irt,pavlik2009pfa,tatsuoka1983rulespace}. Later, DKT and DKVMN use recurrent or memory structures to learn interaction dependencies, while SAKT, SAINT and AKT use attention mechanisms to model more complex long-range relations\citep{piech2015deep,zhang2017dynamic,pandey2019sakt,choi2020saint,ghosh2020akt}. These methods improve KT prediction, but their effectiveness usually relies on substantial overlap in questions, concepts and supervised distributions between training and testing.
+
+When the knowledge concept associated with a test target is absent from training supervision, this shared-distribution assumption no longer holds. The model cannot learn a stable representation from historical labels of that target concept, and it cannot infer the relation between the concept and prior learning experience from discrete question or concept identifiers alone. Prior work has tried to improve new-concept representation with question text, concept semantics and question-concept structure\citep{fu2024sinkt}. This line of work indicates that unseen-concept prediction is not a matter of repeatedly estimating ordinary temporal patterns over seen concepts. It requires transferable links from existing concept experience to the new target concept.
+
+Static concept relations alone are still insufficient to identify effective evidence for a student on a current target. The same unseen concept may require different historical support for different students, and different unseen targets for the same student may activate different learning fragments. Although attention-based KT models can highlight parts of a history, the weighting is usually implicit and does not specify which interactions support cross-concept transfer. This paper therefore focuses on target-conditioned individualized evidence selection. Under the constraint that target concepts lack training-stage supervision, the model retrieves traceable cognitive evidence from the student's history to support the current target prediction.
+
+This paper follows the inductive KT setting in which the training and test distributions of questions or concepts do not fully overlap. It further narrows the focus to test targets that contain knowledge concepts unseen during training. To avoid confusion with new-student cold start or new-question cold start, the paper refers to this setting as unseen-concept inductive prediction.
+
+\subsection{Retrieval Augmentation and Individualized Cognitive Evidence Modeling}
+
+Retrieval-Augmented Generation (RAG) does not simply expand model input. Its central idea is to select relevant evidence from candidate information according to the current query, and to use that evidence to supplement or constrain subsequent inference. The RAG framework proposed by Lewis et al. combines a parametric language model with non-parametric external memory and retrieves relevant text before answer generation, thereby improving information access in knowledge-intensive tasks\citep{lewis2020rag}. Later work further shows that retrievers, rerankers, context selection and evidence organization jointly affect the reliability of language-model outputs.
+
+In education, retrieval augmentation has been used for course question answering, learning resource recommendation, automatic feedback generation and knowledge-base access\citep{li2025ragedusurvey,swacha2025ragchatbots,dong2023kgrag,zheng2024edukdqa}. These studies show that retrieval can anchor model outputs in inspectable external evidence. KT, however, does not require a text answer generated from external documents. It requires a probability prediction for a student's response to the current question based on prior behavior. Retrieval for KT should therefore shift from external documents to the student's own pre-target learning history, and its goal should shift from answering open questions to identifying individualized cognitive evidence for the current prediction.
+
+For unseen-concept prediction, retrieval also supports cross-concept transfer. The current target question serves as the query, and the student's pre-target history serves as the candidate evidence pool. Question text, concept semantics, cognitive attributes, knowledge structure and collaborative behavioral relations are used to assess transfer relations between candidate history and the current target. The retrieval output is not an unfiltered list of interactions. It is a structured evidence set with support direction, cognitive role, relative position and relation source. Such evidence reduces the risk that weakly related history occupies the LLM context, and it allows the probability judgment to be traced back to concrete learning experiences.
+
+\subsection{Reasoning Potential of Large Language Models and Their Constrained Use in KT}
+
+Large language models show strong potential in text understanding, semantic association and conditional inference, and have been used in educational question answering, learning resource generation, personalized feedback and learning analytics\citep{kasneci2023chatgpt,cho2024systematic}. For unseen knowledge concepts, question text and concept descriptions provide semantic entry points for understanding target ability requirements. When the model also receives structured descriptions of the student's existing learning state and the target concept, the LLM can help integrate heterogeneous evidence and perform conditional discrimination.
+
+Existing LLM-enhanced KT methods use language models to encode question and concept semantics, or use instruction alignment and contextual representations to support next-question prediction\citep{fu2024sinkt,wang2025llmkt}. These studies provide a basis for using LLMs in concept generalization, but general language knowledge is not the same as an individual student's knowledge state. If prediction is made directly from question text or free-form generation, the model may be affected by prompt format, external commonsense, generation randomness and post-processing rules. It is then difficult to ensure that the judgment is grounded in the student's historical performance.
+
+This paper therefore does not use the LLM as an open-ended reasoner. It restricts the LLM to a frozen conditional representation and label-discrimination space. Target-conditioned cognitive evidence retrieval first provides the LLM with student evidence that is relevant to the current target, traceable and structured. The structured cognitive summary only compresses this evidence into constrained fields and does not predict the final label. The student-side evidence state, summary-derived features and target-side prior are then mapped into continuous soft slots and fed into the model with a label-constrained prompt. At prediction time, the model reads only the logits of correct and incorrect labels and computes a binary probability. This design preserves the LLM's ability to integrate heterogeneous semantic evidence while limiting judgments based on unrelated commonsense or free-form output.
+
+In summary, this paper does not replace existing KT with retrieval augmentation, and it does not treat the LLM as a knowledge source independent of student history. Instead, target-conditioned cognitive evidence retrieval transforms a student's experience on existing concepts into transferable evidence for unseen concept targets. Hierarchical cognitive context and structured cognitive summaries then form a student-side conditional representation, which soft slots inject into a frozen LLM. The final probability is computed from label logits. Retrieval defines the evidence boundary, the context and summary provide encodable student-side representations, and the frozen LLM supplies a constrained conditional discrimination space. These components jointly serve inductive prediction over unseen knowledge concepts.
+
+\section{Method}
+
+\subsection{Research Problem, Information Boundary and Overall Framework}
+
+\subsubsection{Inductive Prediction over Unseen Knowledge Concepts}
+
+Let \(\mathcal{U}\), \(\mathcal{Q}\) and \(\mathcal{C}\) denote the sets of students, questions and knowledge concepts. For any student \(u\in\mathcal{U}\), the learning process is an interaction sequence ordered by time:
+\[
+S_u=\{(q_{u,1},y_{u,1}),(q_{u,2},y_{u,2}),\ldots,(q_{u,T_u},y_{u,T_u})\}
+\]
+
+Here, \(q_{u,i}\in\mathcal{Q}\) denotes the question answered by student \(u\) at the \(i\)-th interaction, and \(y_{u,i}\in\{0,1\}\) denotes the response outcome. At prediction position \(t\), the question to be predicted is the target question \(q_{u,t}\). The model can use only the interactions that occur before this target:
+\[
+H_{u,<t}=\{(q_{u,i},y_{u,i})\mid 1\leq i<t\}
+\]
+
+This paper defines KT prediction as the following conditional probability estimation problem:
+\[
+p_{u,t}=P(y_{u,t}=1\mid H_{u,<t},q_{u,t})
+\]
+
+The variable \(p_{u,t}\) denotes the theoretical target probability that student \(u\) answers target question \(q_{u,t}\) correctly, and \(\hat{p}_{u,t}\) denotes the model estimate of that probability. During training, the true label \(y_{u,t}\) is used only to compute the supervised loss. During prediction, the target label is not included in the model input.
+
+For unseen-concept targets, prediction also depends on attributes \(a(q_{u,t})\) that are available before the response. These attributes include question text, manually annotated concepts and static cognitive attributes. The multi-source prior module later refines the general conditional probability into \(P(y_{u,t}=1\mid H_{u,<t},q_{u,t},a(q_{u,t}))\).
+
+To define the evaluation boundary for unseen-concept inductive prediction, let \(\mathcal{C}_{\mathrm{train}}\) and \(\mathcal{C}_{\mathrm{test}}\) denote the concept sets used for model fitting and testing, with \(\mathcal{C}_{\mathrm{train}}\cap\mathcal{C}_{\mathrm{test}}=\emptyset\). For a test target \(q_{u,t}\), its associated concept set satisfies \(C(q_{u,t})\cap\mathcal{C}_{\mathrm{test}}\neq\emptyset\). The model therefore receives no supervised interactions associated with the target concept during fitting. It must make the transfer prediction from the student's experience on existing concepts and the observable prior of the target question.
+
+This paper calls this setting inductive prediction over concepts unseen during training. The setting does not additionally assume that the pre-target history contains no interactions with test concepts. If a stricter history-masking protocol is used, it should be reported separately in the experiment.
+
+For an unseen-concept target, interactions in the student's history are not only temporal events. They may also support cross-concept transfer. The same historical record may serve as prerequisite support, a semantic neighbor, homogeneous transfer or structural complement for different targets, or it may be weakly related to the current target. This paper therefore does not compress \(H_{u,<t}\) into a target-agnostic fixed state. It treats the history as a candidate set for evidence selection around the current unseen target question.
+
+\subsubsection{Question Priors and Transferable Evidence Representation}
+
+Under unseen-concept conditions, a question cannot be represented only by a discrete question ID. It must also be described by cognitive attributes available before the response. For any question \(q\), this paper characterizes its cognitive features from question text, associated concepts, cognitive level, difficulty attributes, semantic representation, graph-structural relations and collaborative behavioral relations.
+
+Question text and manually annotated concepts provide semantic entry points for unseen targets. Cognitive level and question type describe ability requirements. Graph structure and collaborative behavioral relations connect the target with existing concepts and existing questions. Together, these attributes form a multi-source cognitive prior on the question side.
+
+For target question \(q_{u,t}\), the question-side cognitive prior describes the knowledge and cognitive requirements of the current prediction target. For historical question \(q_{u,i}\), it is used to judge the relation between that historical question and the target question.
+
+This paper explicitly distinguishes the raw question identifier from the semantic identifier representation. The hierarchical semantic identifier characterizes the question's position in semantic space and is not equivalent to the original question ID. For a historical interaction \((q_{u,i},y_{u,i})\), this paper treats the interaction as candidate cognitive evidence. Each evidence item contains three types of information: the cognitive attributes of the historical question, the student's response outcome on that question, and the relation between the historical question and the current target question.
+
+The historical response outcome indicates the student's performance on that question, but its predictive meaning depends on the relation between the historical question and the target. For example, a correct response on a historical question that shares a knowledge concept with the target usually provides stronger support than a correct response on an unrelated question. An incorrect response on a prerequisite question may also indicate risk for the current target.
+
+This paper therefore defines the evidence value of a historical interaction as a target-conditioned relational property, rather than as a static label of the question itself. Each candidate evidence item has a specific cognitive role in the current prediction, such as prerequisite support, homogeneous transfer, semantic neighbor, higher-order transfer, graph-structural complement or collaborative complement. The cognitive role explains why the historical interaction is related to the target question and provides a structured basis for evidence retrieval and context construction.
+
+\subsubsection{Pre-Target History and Prediction-Time Information Boundary}
+
+This paper follows both the pre-target history constraint and the information boundary of unseen-concept inductive prediction. For a target sample \((u,t,q_{u,t})\), the model can use only the student's history before \(t\), denoted by \(H_{u,<t}\), and the attributes of the target question that are available before the response. The model does not use the target label \(y_{u,t}\) or future interactions. The target label is used only to compute the loss during training and metrics during evaluation. This boundary applies to target-conditioned cognitive evidence retrieval, hierarchical cognitive context construction, structured cognitive summary generation and soft-slot probability prediction.
+
+Beyond static attributes such as question text, manually annotated concepts and cognitive level, question difficulty, collaborative behavioral relations, knowledge-graph statistics and behavioral embeddings all depend on student response records. To avoid leaking test-concept information through behavioral statistics, such priors are constructed only from fitting-set interactions and are frozen during validation and testing. The label of any validation or test target, future interactions, and labels from validation or test sets must not participate in question-prior construction, evidence selection or model input.
+
+The target-conditioned cognitive evidence retrieval module first selects historical evidence only from \(H_{u,<t}\); the retrieval target never includes the response outcome of the target question or future interactions. The hierarchical cognitive context construction module then summarizes only pre-target historical evidence and its structured relations into a student-side cognitive context. The structured cognitive summary generation module compresses only the selected pre-target evidence and its statistical summary. It receives no target label and does not output a final prediction label.
+
+Finally, the frozen-LLM soft-slot probability prediction module receives only the student-side cognitive context, structured cognitive summary-derived features, the target-side cognitive prior and a label-constrained prompt. It outputs the probability of a correct response.
+
+With these definitions, KT becomes a problem of target-conditioned cognitive evidence selection and probability prediction. The model input is not a concatenation of the full history, but pre-target cognitive evidence selected and organized around the current target question. The model output is not a natural-language explanation or open-ended answer, but the predicted probability \(\hat{p}_{u,t}\) of a correct response. This definition provides a unified basis for multi-source question-prior modeling, target-conditioned cognitive evidence retrieval, hierarchical cognitive context construction, structured cognitive summary generation and soft-slot probability prediction.
+
+\subsubsection{Overall Framework for Unseen Knowledge Concepts}
+
+Given a target sample \((u,t,q_{u,t})\), Cognitive-RAG KT takes the pre-target history \(H_{u,<t}\) and the attributes of the target question available before the response as input. The model outputs the probability of a correct response, \(\hat{p}_{u,t}\).
+
+When \(C(q_{u,t})\cap\mathcal{C}_{\mathrm{test}}\neq\emptyset\), the model has no supervised interactions for that concept during fitting. The key challenge is therefore not to learn a new discrete identifier for the new concept. It is to transform the target-side prior into a transfer interface that connects the target to existing learning experience.
+
+The framework performs five steps: question-side multi-source cognitive prior modeling, target-conditioned cognitive evidence retrieval, hierarchical cognitive context construction, structured cognitive summary generation, and frozen-LLM soft-slot probability prediction. The prior and retrieval modules use target-question attributes to establish cross-concept relations and select transferable evidence from histories over existing concepts. The context and summary modules organize target-conditioned evidence into a student-side conditional representation. The prediction module encodes the student-side representation and target prior into continuous soft slots, thereby avoiding compression of the full history into a target-agnostic fixed state.
+
+\begin{figure}[t]
+    \centering
+    \includesvg[inkscapelatex=false,width=\textwidth]{figures/model}
+    \caption{Overall framework of Cognitive-RAG KT. The model takes a target question and the student's pre-target history as input, retrieves Top-K transferable cognitive evidence from the history window conditioned on the target question, organizes the evidence into a hierarchical cognitive context, and generates a structured cognitive summary that compresses mastered concepts, weak concepts, transfer state, risk level and evidence quality. The student-side context and target-side prior are mapped into context and target soft slots, injected into a frozen LLM, and used to output the probability of a correct response from label logits.}
+    \label{fig:cognitive-rag-overview}
+\end{figure}
+
+In the information flow, the target-side prior includes text semantics, hierarchical semantic identifiers, cognitive-enhanced representations, collaborative relations and knowledge-structure information. Text and manually annotated attributes provide direct descriptions for unseen concepts. Relational attributes identify possible transfer paths between the unseen target and existing concepts.
+
+The target-conditioned cognitive evidence retrieval module uses these signals to recall and rerank interactions from the student's pre-target history that are related to the unseen target. Each retained evidence item includes the historical question, response outcome, historical position, evidence role and support score. The hierarchical cognitive context module organizes these discrete evidence items into a global cognitive state, local evidence blocks and evidence-structure features. The structured cognitive summary further adds compressed information about mastered concepts, weak concepts, transfer state and evidence quality.
+
+The student-side representation and the target-side prior are then mapped into context soft slots and target soft slots. The two types of slots are injected into a label-constrained prompt. The frozen LLM reads only candidate label logits and computes \(\hat{p}_{u,t}\) through softmax.
+
+\subsection{Multi-Source Cognitive Priors and Target-Conditioned Cognitive Evidence Retrieval}
+
+\subsubsection{Transferable Multi-Source Cognitive Priors}
+
+The core difficulty of unseen concepts is that discrete question or concept IDs have learnable parameter meaning only in the fitting data, while the IDs of test targets provide no directly reusable supervision signal. This paper therefore treats each question as an object characterized jointly by text content, associated concepts, cognitive attributes and its relations to existing learning objects. It then constructs a multi-source cognitive prior on the question side.
+
+For the question set \(\mathcal{Q}=\{q_1,q_2,\ldots,q_M\}\), each question \(q_j\) is described by its stem text, associated concepts, cognitive attributes and statistical features that can be estimated within the unseen-concept evaluation boundary. This representation is not a substitute memory for new concept IDs. Instead, it provides a common coordinate system that allows the model to judge, from observable attributes, whether a transferable relation exists between a new target and historical questions.
+
+The goal of multi-source cognitive prior modeling is to generate, for each question, a prior representation \(r_j\) for retrieval and prediction. This representation should capture the meaning of the question and its position in the learning-behavior network. The first component is a text-semantic prior. Question text contains the problem statement, objects to be solved, required operations and implicit knowledge requirements. It provides the basis for judging whether two questions are content-related. This paper maps question text into a semantic vector space and obtains the text-semantic representation \(s_j\).
+
+In this representation space, semantically close questions have closer vector representations. The retrieval module uses this property to identify historical questions that are close to the target in stem meaning, knowledge expression or required operation. Compared with relying only on question IDs or knowledge-point labels, the text-semantic prior supplements information that may be missing because of coarse concept annotation. It allows retrieval to consider not only whether two questions belong to the same concept, but also whether they assess related abilities in similar ways.
+
+The second component is a hierarchical semantic identifier prior. A hierarchical semantic identifier is not the raw question ID. It encodes the position of a question in a semantic hierarchy or question-cluster structure. This prior characterizes coarse-to-fine relations among questions. Higher levels reflect broad semantic categories or knowledge regions, while lower levels reflect finer question similarity.
+
+For question \(q_j\), the hierarchical semantic identifier representation \(h_j\) describes its position in the hierarchical semantic space. This representation allows retrieval to consider both fine-grained neighboring questions and higher-level related questions, and it avoids selecting evidence only from exactly identical concepts or locally similar texts.
+
+Beyond text semantics and hierarchical semantic identifiers, this paper constructs a cognitive-enhanced semantic prior. Relations between questions depend not only on text similarity, but also on difficulty, cognitive requirement, question-type structure and knowledge organization. Two textually similar questions may have different evidence meaning if their difficulty levels differ substantially. Conversely, two questions with different surface texts may still provide useful transfer evidence if they share similar cognitive operations or solution structures.
+
+This paper therefore integrates question difficulty, cognitive direction and structural information into the semantic representation to obtain the cognitive-enhanced semantic representation \(c_j\). This representation characterizes cognitive proximity among questions and helps the retrieval module identify related historical interactions under the same ability requirement, rather than relying only on surface text similarity.
+
+\subsubsection{Difficulty, Cognitive Level and State Features}
+
+Question-side priors describe questions and their relations to other questions, but KT prediction must also account for the student's response state in historical interactions. For the same historical question, correct and incorrect responses convey different cognitive meanings. For the same response outcome, evidence value also depends on question difficulty, historical position and recent student performance.
+
+This paper therefore builds dynamic student-state features in addition to question priors. These features interpret the meaning of historical response outcomes at the current prediction time. Let \(H_{u,<t}\) denote the history of student \(u\) before target question \(q_{u,t}\).
+
+For any historical interaction \((q_i,y_i)\) with \(i<t\), the difficulty and cognitive level of question \(q_i\) provide question-side background, while the response label \(y_i\) reflects the student's actual performance. Repeated errors on low-difficulty questions are more likely to indicate insufficient mastery of foundational concepts. Errors on high-difficulty or integrative questions may indicate weakness in higher-order transfer or complex problem solving. Conversely, a correct response on a difficult question related to the target usually provides stronger positive evidence than a correct response on an easy question.
+
+By incorporating question difficulty, cognitive level and historical response outcome into state features, candidate evidence is no longer a discrete record of whether a question was answered correctly. It becomes a historical state fragment with cognitive interpretation. Dynamic student-state features also describe recent trends and stability in the pre-target history.
+
+Knowledge mastery evolves over time. Early errors and recent correct responses from the same student can have different effects on current prediction. When constructing the student-side state, this paper retains historical position, recent performance and local response patterns. This allows retrieval and context construction to distinguish long-term background evidence from recent state evidence.
+
+Thus, before a historical interaction enters the evidence set, it already contains two types of information. One comes from the multi-source cognitive prior of the question itself. The other comes from the student's actual response state on that question. Together, they determine the support direction and support strength of the historical interaction for the current target question.
+
+Based on the above modeling, this paper combines question-side multi-source cognitive priors and student-side dynamic state features into a retrieval-oriented candidate evidence representation. For a historical interaction \((q_i,y_i)\), the evidence representation consists of question text semantics, hierarchical semantic identifier, cognitive-enhanced semantics, question difficulty, cognitive level, historical response outcome and positional state. This representation provides a unified input for target-conditioned cognitive evidence retrieval, so that the model can select cognitively interpretable evidence from the student's history according to the current target question.
+
+\subsubsection{Collaborative and Graph-Structural Priors for Cross-Concept Transfer}
+
+Beyond question text and knowledge attributes, student-group response behavior contains rich question-relation information. If many students show similar response patterns across several questions, those questions may have latent knowledge relations, difficulty relations or learning-path relations. This paper therefore constructs a collaborative prior to capture question relations at the group-behavior level.
+
+The collaborative prior does not come directly from question text. It comes from co-occurrence and response patterns reflected by student-question interaction data. For question \(q_j\), the collaborative representation \(a_j\) describes its relative position in group learning behavior. This representation supplements behavioral relations that text semantics and knowledge-point labels may fail to cover. It enables the retrieval module to identify historical questions related to the target in group performance.
+
+The collaborative prior expands evidence sources. Some questions are not textually similar and may not share exactly the same knowledge-point labels, but student performance on them can be highly correlated. For example, one question may test basic recognition of a concept, while another tests the application of that concept in a complex situation. Their stems may differ substantially, but group response patterns may reveal a relation between prerequisite mastery and transfer application. The collaborative prior allows retrieval to use such relations formed by real response behavior, providing supplementary evidence beyond text similarity and concept overlap.
+
+This paper also constructs graph-structural and concept-relation priors to describe structural links between questions and knowledge concepts. In KT, a question is usually associated with one or more knowledge concepts, and concepts may have co-occurrence, prerequisite, inclusion or adjacency relations. Direct concept overlap alone can miss many indirectly related questions.
+
+This paper therefore organizes question-concept relations and inter-concept structural relations as graph-structural information, and obtains the structural representation \(g_j\) of each question. This representation complements direct knowledge-point labels and allows the retrieval module to identify historical interactions that have indirect concept links or structural proximity to the target question.
+
+The question-side information is represented as a structured cognitive prior:
+\[
+r_j=\left(\mathbf e_j^{\mathrm{sem}},\mathbf a_j,\mathcal N_j^{\mathrm{graph}},\mathcal N_j^{\mathrm{collab}},\mu_j,\ell_j\right).
+\]
+
+Here, \(\mathbf e_j^{\mathrm{sem}}\) denotes the semantic representation formed jointly by question text, hierarchical semantic identifiers and cognitive attributes. \(\mathbf a_j\) denotes the question representation in group response behavior. \(\mathcal N_j^{\mathrm{graph}}\) and \(\mathcal N_j^{\mathrm{collab}}\) denote the knowledge-structure neighborhood and collaborative-behavior neighborhood. \(\mu_j\) and \(\ell_j\) denote question difficulty and cognitive level.
+
+This structured prior does not replace the student's historical sequence. It provides the question-side cognitive basis for target-conditioned cognitive evidence retrieval.
+
+By unifying question semantics, knowledge structure, group behavior and cognitive attributes in prior modeling, this paper assigns an inspectable transfer description to each candidate historical interaction. Subsequent modules can then perform conditioned evidence selection and context organization around the current unseen target question.
+
+The unseen-concept inductive evaluation protocol requires any difficulty, collaborative or graph statistics that depend on response records to be constructed only from interactions in \(\mathcal{C}_{\mathrm{train}}\). Labels and interactions of test concepts must not participate in estimating these statistics. An unseen target question can therefore use its pre-response text, annotations and exogenous structural attributes to locate transfer paths, but it cannot obtain implicit supervision through behavioral statistics of the target concept.
+
+\subsubsection{Two-Stage Transfer Evidence Retrieval for Unseen Targets}
+
+For a target question associated with unseen concepts, the student's history contains no fitting-stage supervision that can be directly indexed by the target concept ID. The retrieval module is therefore not responsible for mechanically compressing a long sequence. It must use the target-question prior as a condition and identify which interactions on existing concepts can serve as transfer evidence for the target.
+
+Given student \(u\), prediction time \(t\) and target question \(q_{u,t}\), the module selects from the pre-target history \(H_{u,<t}\) only an evidence set \(E_{u,t}\) that has interpretable relations to \(q_{u,t}\). This set is then passed to the context construction and prediction modules. In this design, the semantic, cognitive or structural description of the target concept determines what to retrieve, while the student's response outcomes on seen concepts determine what support the evidence provides for that target.
+
+Let the pre-target history of student \(u\) be
+\[
+H_{u,<t}=\{(q_1,y_1),(q_2,y_2),\ldots,(q_{t-1},y_{t-1})\}
+\]
+
+where \(q_i\) denotes the question in the \(i\)-th historical interaction, and \(y_i\in\{0,1\}\) denotes the student's response outcome. The two-stage cognitive evidence retrieval module takes \((u,t,q_{u,t},H_{u,<t})\) as input and outputs the evidence set
+\[
+E_{u,t}=\{e_{u,t}^{1},e_{u,t}^{2},\ldots,e_{u,t}^{K}\}
+\]
+
+where each evidence item \(e_{u,t}^{k}\) corresponds to one historical interaction and its cognitive relation to the target question. Unlike ordinary sequence truncation or recent-interaction selection, the retrieval process is driven by the target question. The same student history produces different evidence sets for different target questions, because the evidence value of a historical question depends on its knowledge relation, semantic relation, cognitive role and response state with respect to the current target.
+
+Target conditionality is the core constraint of evidence retrieval. Historical interactions do not reflect student ability in isolation. They express different cognitive meanings under different target questions.
+
+For example, a correct response on a basic question provides prerequisite support when predicting an advanced question on the same knowledge chain. Its evidence value decreases when the target is weakly related. Similarly, an incorrect response on a semantically close or structurally related question can indicate potential risk for the current question. The two-stage retrieval mechanism explicitly models this conditional relation between historical interaction and target question, so that subsequent prediction depends on selected and organized cognitive evidence rather than on concatenated full history.
+
+\subsubsection{Candidate Recall}
+
+The first stage forms a candidate set from a limited history window before the target question:
+\[
+C_{u,t}=\{(q_{u,i},y_{u,i})\mid t-W\leq i<t\}.
+\]
+
+For each historical interaction in the candidate set, the model does not treat knowledge concepts, semantics, cognitive level, collaborative behavior and graph structure as independent recall channels. It treats them as multi-source signals that characterize the relation between the historical question and the target question. The first stage uses these signals to compute a target-relevance score and retains high-scoring candidates, providing a candidate space that covers different cognitive relations for subsequent evidence selection.
+
+\subsubsection{Evidence Reranking}
+
+The second stage evaluates evidence value over the candidate set \(C_{u,t}\). For a candidate evidence item \(e_i=(q_i,y_i)\), its support score with respect to target question \(q_{u,t}\) is defined as
+\[
+s_{i,t}=\lambda_{\mathrm{k}}s^{\mathrm{k}}_{i,t}+\lambda_{\mathrm{s}}s^{\mathrm{s}}_{i,t}+\lambda_{\mathrm{g}}s^{\mathrm{g}}_{i,t}+\lambda_{\mathrm{c}}s^{\mathrm{c}}_{i,t}+\lambda_{\mathrm{y}}s^{\mathrm{y}}_{i,t}+\lambda_{\mathrm{r}}s^{\mathrm{r}}_{i,t}.
+\]
+
+Here, \(s^{\mathrm{k}}_{i,t}\) denotes concept association, \(s^{\mathrm{s}}_{i,t}\) denotes semantic and cognitive-level association, \(s^{\mathrm{g}}_{i,t}\) denotes knowledge-structure association, and \(s^{\mathrm{c}}_{i,t}\) denotes collaborative-behavior association. \(s^{\mathrm{y}}_{i,t}\) denotes the support direction of the historical response outcome for the current prediction, and \(s^{\mathrm{r}}_{i,t}\) denotes the time-decay term.
+
+The coefficients are determined within the fitting set or specified by a unified configuration, and are fixed during testing. For unseen-concept targets, the first four relation terms are computed from the pre-response prior of the target question and the priors of seen historical questions, while \(s^{\mathrm{y}}_{i,t}\) encodes only the student's observed outcome on a historical question. The scoring process never uses the response label of the target concept. This mechanism unifies question relations, student performance, cognitive role and historical position as ranking criteria for cross-concept transfer.
+
+Prerequisite support indicates a basic-to-advanced relation between the historical question and the target question. The student's performance on the prerequisite question reflects mastery of foundational ability needed for the target. Homogeneous transfer indicates that the historical question and target question are highly close in knowledge concept, question-type structure or cognitive requirement. Performance on such questions directly reflects the student's handling of similar tasks.
+
+Semantic neighbor evidence indicates that the historical question and target question are close in text semantics or problem expression. This evidence supplements question similarity that explicit knowledge-point annotation cannot cover. Higher-order transfer indicates a cross-concept or cross-level relation between the historical question and the target question, reflecting whether the student can transfer existing knowledge to more complex or differently expressed tasks.
+
+Graph-structural complement indicates that the historical question and target question are connected through the concept graph or structural relations. This evidence provides structural links beyond direct knowledge-point overlap. Collaborative complement indicates that the two types of questions show correlated performance in group response behavior. This evidence reflects latent question relations formed by real learning behavior.
+
+When computing candidate evidence value, this paper also considers the directionality of response state. For a historical question closely related to the target, a correct response usually provides positive support, while an incorrect response indicates potential risk. For questions with high difficulty or higher-order transfer relations, the response outcome also reflects stability under complex cognitive requirements.
+
+This paper incorporates this directionality into the support score, so that reranking distinguishes not only relevant from irrelevant evidence, but also the support direction of historical evidence for the current prediction. Evidence retrieval is therefore not equivalent to question-similarity ranking. It is cognitive evidence selection for KT prediction.
+
+\subsubsection{Coverage and Redundancy Control}
+
+Selecting top-ranked candidate interactions only by support score can produce many historical questions with similar sources, repeated roles or highly overlapping semantics. Such an evidence set may have high local relevance, but it cannot fully cover the diverse cognitive information needed for the current prediction.
+
+This paper therefore introduces coverage and redundancy control in final evidence selection. The output set preserves high-support evidence while covering different cognitive roles and relation sources. Coverage control requires the final evidence set to contain multiple cognitive relation sources. For a target question, the model considers not only questions with the same knowledge point, but also semantic neighbors, prerequisite support, graph-structural neighbors and collaborative-behavior related questions.
+
+Different evidence roles describe student state from different perspectives. Homogeneous transfer emphasizes performance on similar tasks. Prerequisite support emphasizes foundational ability. Semantic neighbors emphasize stem-expression relatedness. Higher-order transfer emphasizes cross-level ability. Graph-structural complement emphasizes concept-structure links. Collaborative complement emphasizes group-behavior relations.
+
+By retaining representative evidence from multiple roles, the final evidence set obtains broader target-conditioned coverage. Redundancy control prevents the final evidence set from being dominated by a small number of similar questions.
+
+If multiple candidate historical questions have highly similar semantic representations, the same knowledge concept and the same evidence role, the module preferentially retains interactions with higher support scores, more representative historical positions or more interpretable response states. This reduces the space occupied by repeated evidence. The mechanism preserves more complementary information within a limited length and provides stable input for hierarchical cognitive context construction.
+
+Formally, this paper constructs the final evidence set greedily:
+\[
+E_{u,t}=\arg\max_{|E|=K}\left[\sum_{e_i\in E}s_{i,t}+\lambda_{\mathrm{cov}}\operatorname{Cov}(E,q_{u,t})-\lambda_{\mathrm{red}}\operatorname{Red}(E)\right],
+\]
+
+where \(\operatorname{Cov}(E,q_{u,t})\) measures the coverage of different transfer-relation sources and target ability requirements. \(\operatorname{Red}(E)\) measures semantic, concept and role repetition among evidence items. This constraint prevents the model from judging unseen targets through a single surface-similarity path. It allows the set to retain complementary evidence such as prerequisite support, homogeneous transfer and structural complement under limited capacity. The history-window length \(W\), candidate size and final evidence count \(K\) are reported in the experimental settings.
+
+The target-conditioned cognitive evidence retrieval module finally outputs the evidence set \(E_{u,t}\). Each evidence item contains the historical question, historical response outcome, evidence role, support score, historical position and relation source with the target question.
+
+This output is not a simple list of historical questions. It is a structured cognitive evidence set formed by target-conditioned recall, evidence-value reranking and coverage-redundancy control. The hierarchical cognitive context construction module organizes the student-side cognitive state and local evidence blocks from this set, and passes them to the frozen-LLM soft-slot probability prediction module to compute the probability of a correct response on the target question.
+
+\subsection{Hierarchical Cognitive Context Construction}
+
+\subsubsection{From Cross-Concept Discrete Evidence to Structured Transfer Context}
+
+The two-stage retrieval module outputs discrete transfer evidence from histories over existing concepts. If these interactions are only concatenated by time or retrieval score, the predictor must still distinguish general student state, evidence that supports the current target, and the cross-concept relations behind that support. Local evidence may also accumulate without an explicit transfer structure. This paper therefore constructs a hierarchical cognitive context that organizes the retrieved results into a structured representation containing a global cognitive state, local transfer evidence blocks and a target-question representation.
+
+Given student \(u\), prediction time \(t\), target question \(q_{u,t}\) and retrieved evidence set \(E_{u,t}\), this module produces a student-side cognitive context representation \(x^{ctx}_{u,t}\) and a target-side representation \(x^{tar}_{t}\). The former describes the student's performance, evidence structure and state features in the history over existing concepts. The latter describes the semantics, hierarchy, cognition and available relational priors of the current unseen question.
+
+The two representations are not interchangeable. The student-side representation provides observed ability evidence, while the target-side representation specifies the ability requirement to which that evidence should be transferred.
+
+The subsequent frozen-LLM soft-slot probability prediction module receives these two representations separately and injects them into context soft slots and target soft slots through projectors. The context constructed here is neither a natural-language expansion of the full history nor a simple list of retrieved entries. It explicitly retains the selected interactions, their relations to the unseen target and the student's responses on those interactions, thereby providing sourced transfer conditions for probability prediction.
+
+The hierarchical cognitive context therefore links the retrieval module and the prediction module. The retrieval module selects relevant evidence from the pre-target history. The context construction module converts this evidence into a cognitive state representation with hierarchical structure and numerical features. The prediction module then computes the probability of a correct response on the current target question.
+
+\subsubsection{Target-Conditioned Global Cognitive State}
+
+The global cognitive state summarizes the student's overall learning state under the current target question. Compared with single historical evidence items, the global state emphasizes aggregate trends reflected by the evidence set, including recent response performance, risk level, dynamic state and the distribution of major evidence roles. This paper combines retrieved evidence \(E_{u,t}\) with state information in the student's historical interactions to generate the global cognitive state \(G_{u,t}\). This state does not replace local evidence. It provides global context for local evidence.
+
+Specifically, this paper aggregates only the retrieved pre-target evidence with target-relevance weights:
+\[
+{G_{u,t}=\sum_{k=1}^{K}\alpha_{k,t}\left[\mathbf e_{i_k}^{\mathrm{sem}};y_{u,i_k};\boldsymbol{\rho}_{i_k,t};\delta_{i_k,t}\right],\qquad \alpha_{k,t}=\frac{\exp(s_{i_k,t})}{\sum_{j=1}^{K}\exp(s_{i_j,t})},}
+\]
+
+Here, \(i_k\) denotes the original position of the \(k\)-th retrieved evidence item in the pre-target history. \(\boldsymbol{\rho}_{i_k,t}\) denotes the cognitive-relation role of that historical interaction with respect to the target question, and \(\delta_{i_k,t}\) denotes its historical position information. Thus, \(G_{u,t}\) describes overall learning trends and risk, while local evidence blocks retain the specific support source of each interaction for the current prediction.
+
+First, the global cognitive state contains recent-trend information. Student knowledge states evolve over time, and recent interactions usually reflect current mastery more directly. When constructing the global state, this paper includes recent response accuracy, recent error patterns and changes in performance within the pre-target history. The context can therefore describe the student's state near the prediction time and distinguish occasional long-term history from stable current trends.
+
+Second, the global cognitive state contains risk-level information. Risk level is jointly determined by the student's response outcomes on relevant evidence, question difficulty and the support relation between evidence and target. If the student makes errors on historical questions that are highly related to the target, or shows unstable performance on prerequisite support questions, the global state reflects higher prediction risk. If the student maintains correct performance over multiple classes of related evidence, the global state reflects stronger positive support. This risk description provides an overall target-conditioned basis for subsequent prediction.
+
+Third, the global cognitive state contains dynamic student state and major evidence roles. The dynamic state describes local mastery changes in the pre-target history, while major evidence roles describe which cognitive relations dominate the current evidence set. For example, if the set is dominated by homogeneous transfer and semantic neighbors, the context emphasizes performance on similar questions. If it is dominated by prerequisite support and higher-order transfer, the context emphasizes the relation between foundational ability and complex tasks.
+
+By recording the distribution of evidence roles, the global state provides the prediction module with summary information about evidence-source structure.
+
+\subsubsection{Local Transfer Evidence Blocks}
+
+Local evidence blocks retain fine-grained information for each retrieved evidence item. For each evidence item \(e_{u,t}^{k}\) in \(E_{u,t}\), this paper constructs a corresponding local evidence block \(B_{u,t}^{k}\). Each block contains the historical question representation, historical response outcome, evidence relation, support strength, historical position and role annotation with respect to the target question. Unlike the global cognitive state, a local evidence block does not compress the evidence set as a whole. It preserves the specific contribution source of a single evidence item for the current prediction.
+
+A local evidence block first records the historical question and its question-side cognitive prior. Text semantics, hierarchical semantic identifier, cognitive-enhanced semantics, collaborative representation and graph-structural relation together describe the historical question's position in the multi-source cognitive space. The block then records the student's response outcome on that historical question. The response label determines the support direction for the current prediction. For a historical question closely related to the target, a correct response provides positive evidence, while an incorrect response indicates potential risk.
+
+The block also records the evidence relation between the historical interaction and the target question, including prerequisite support, homogeneous transfer, semantic neighbor, higher-order transfer, graph-structural complement and collaborative complement. This role information allows the prediction module to distinguish the cognitive meanings of different evidence items, rather than treating all historical questions as homogeneous inputs.
+
+Local evidence blocks further contain support strength and historical position. Support strength comes from the reranking stage and reflects the comprehensive evidence value of the historical interaction with respect to the target. Historical position describes the temporal location of the interaction in the student's pre-target sequence and helps distinguish recent evidence from earlier evidence. In KT, temporal position is not simply equivalent to evidence value, but it provides necessary background for understanding changes in student state. This paper therefore retains both relation strength and historical position in each evidence block, so that local evidence has both target relevance and sequential state meaning.
+
+Through local evidence blocks, retrieved results are converted into a structured evidence sequence:
+\[
+B_{u,t}=\{B_{u,t}^{1},B_{u,t}^{2},\ldots,B_{u,t}^{K}\}
+\]
+
+Each element in this sequence corresponds to one target-conditioned evidence item and contains its question attributes, response state, evidence role and support information. The subsequent context representation preserves local evidence differences and describes the student's current knowledge mastery together with the global cognitive state.
+
+\subsubsection{Structured Cognitive Summary}
+
+Beyond the global state and local evidence blocks, this paper introduces a structured cognitive summary to compactly compress retrieved evidence under the target condition. This step uses a frozen LLM to read the target question, the student's recent statistical summary and the selected target-conditioned evidence. Its output is restricted to constrained summary fields rather than free-text prediction. Specifically, the summary contains stable mastered points, persistent weak points, transfer state, risk level, evidence quality and a brief evidence description. These fields describe the conditional meaning of retrieved evidence for the current target question.
+
+Formally, the structured cognitive summary is denoted as
+\[
+D^{\mathrm{sum}}_{u,t}=\{\mathcal M_{u,t},\mathcal W_{u,t},\tau_{u,t},r_{u,t},\eta_{u,t},d_{u,t}\},
+\]
+where \(\mathcal M_{u,t}\) and \(\mathcal W_{u,t}\) denote evidence-supported mastered points and weak points, \(\tau_{u,t}\) denotes transfer state, \(r_{u,t}\) denotes risk level, \(\eta_{u,t}\) denotes evidence quality, and \(d_{u,t}\) denotes a brief evidence description.
+
+This summary is not used as the final label and does not participate in open-ended explanation generation. Its role is to compress multiple retrieved evidence items into encodable evidence-compression signals. The summary description is then encoded as a context vector, and the structured fields in the summary are converted into explicit features. Together with the global state and local evidence blocks, these features form the student-side context input.
+
+To make this step reproducible, this paper implements the structured cognitive summary as a schema-constrained evidence compressor rather than an open-ended text generation module. The summarizer input contains only observable target-question information, the target concept set, the student's pre-target recent template-based statistical summary, and the evidence IDs, roles, support strengths, historical response outcomes and question texts in the selected evidence set \(E_{u,t}\). The input does not contain the current target response label.
+
+The output is restricted to a single JSON object. The object must contain six top-level fields: \texttt{mastered\_concepts}, \texttt{weak\_concepts}, \texttt{transfer\_state}, \texttt{risk\_level}, \texttt{evidence\_quality} and \texttt{diagnosis}.
+
+The mastered-concept and weak-concept fields contain at most three entries each. Each entry consists of a concept name, a set of evidence IDs and a confidence level. Risk level, evidence quality and confidence use the discrete levels low, medium and high.
+
+The implementation constrains decoding with a JSON-only system prompt, an explicit user prompt, \texttt{response\_format=json\_object}, temperature 0.0 and a maximum output length of 256 tokens. Parsing failures or invalid fields trigger at most three retries. A summary that remains invalid is not passed to subsequent encoding.
+
+During encoding, a valid summary is first rewritten into short text channels for stable mastery, weak risk, diagnostic statement and auxiliary state, and is combined with the target-conditioned context to form a summary-side embedding. The summary fields are also converted into fixed-dimensional structural features, including the number of mastered concepts, the number of weak concepts, indicators for the presence of mastered and weak concepts, normalized diagnosis length, risk-level one-hot features and evidence-quality one-hot features.
+
+The summary embedding and summary-derived structural features enter the context projector as part of the student-side context features. In this paper, the structured cognitive summary is therefore a verifiable intermediate representation, rather than a free-text explanation that requires post hoc parsing.
+
+\subsubsection{Context Representation for the Frozen Predictor}
+
+The hierarchical cognitive context is finally converted into structured features for the soft-slot probability prediction module. This paper separates the context representation into a student-side cognitive context representation and a target-side representation. The student-side cognitive context representation consists of the global cognitive state, local evidence blocks, structured cognitive summary, evidence-structure features and numerical state features. The target-side representation consists of question text semantics, hierarchical semantic identifier, cognitive-enhanced semantics, collaborative vector and related cognitive attributes. These two representations correspond to the student's current state and the current prediction target, allowing the prediction module to receive both what state the student exhibits and what ability the current question requires under the same task constraint.
+
+The student-side cognitive context embedding integrates the global state and local evidence blocks, while absorbing compressed information from the structured cognitive summary. This embedding incorporates information about historical questions, response outcomes, evidence roles and support strengths in the retrieved evidence, forming a target-conditioned student-state representation.
+
+Evidence-structure features preserve how the evidence set is composed, including major evidence roles, evidence count, support-score distribution and coverage over different relation sources. Summary-derived features preserve compressed evidence signals such as the number of mastered concepts, the number of weak concepts, transfer state, risk level and evidence quality. Numerical state features describe recent performance, risk level and dynamic trends. Together, these elements form the student-side cognitive context features, so that subsequent prediction uses not only semantic embeddings but also explicit structure and numerical state.
+
+The target-side representation describes the current prediction object. The text-semantic representation characterizes question content, the hierarchical semantic identifier characterizes the position of the question in the semantic hierarchy, the cognitive-enhanced semantic representation characterizes question difficulty, cognitive direction or structural attributes, and the collaborative vector characterizes the question's position in group response behavior. The target-side representation and student-side context representation complement each other. The former describes what the target requires, and the latter describes the student's evidence state under that target condition. Together, they determine the non-text structured input received by the soft-slot probability prediction module.
+
+The hierarchical cognitive context construction module outputs
+\[
+X_{u,t}=(x^{ctx}_{u,t},x^{tar}_{t})
+\]
+
+where \(x^{ctx}_{u,t}\) denotes the student-side cognitive context features, and \(x^{tar}_{t}\) denotes the target-side multi-source prior features. This output compresses and organizes discrete retrieved evidence into a structured representation suitable for the prediction module, and it supplements target-conditioned evidence-compression information through the structured cognitive summary. This design avoids directly stacking the full historical interaction sequence into the prompt text.
+
+The subsequent frozen-LLM soft-slot probability prediction module maps \(x^{ctx}_{u,t}\) and \(x^{tar}_{t}\) into context soft slots and target soft slots, respectively, and computes the probability that the student answers the target question correctly under label constraints.
+
+Thus, hierarchical cognitive context construction bridges the preceding and following modules. It integrates student performance on seen concepts, cross-concept evidence roles and observable priors of unseen targets into a unified representation, while preserving the responsibility boundary of each information type in unseen-concept inference.
+
+\subsection{Frozen-LLM Soft-Slot Probability Prediction}
+
+\subsubsection{Constrained Representation Space of the Frozen LLM}
+
+After hierarchical cognitive context construction and structured cognitive summary generation, the model obtains the student-side cognitive context features \(x^{ctx}_{u,t}\) and the target-side multi-source prior features \(x^{tar}_{t}\). The former summarizes the evidence state related to the current target in the student's history over existing concepts, together with compressed evidence signals from the summary. The latter provides the semantics, hierarchy, cognition and relation description of the unseen target.
+
+Based on these two inputs, this paper builds a frozen-LLM soft-slot probability prediction module. The module learns to map existing performance to an estimate of the correct-response probability \(\hat{p}_{u,t}\) for an unseen-concept question under the target condition.
+
+This paper uses the frozen LLM as a constrained conditional representation and label-discrimination space, not as a free generator or external knowledge source. The main LLM parameters are not trained. Training updates only the student-side context projector and target-side projector, allowing the structured cognitive evidence from preceding modules to enter the continuous input space of the LLM.
+
+This constraint has two effects. First, it limits the model from memorizing supervised information about test concepts by changing language-model parameters. Second, it makes prediction improvement on unseen concepts mainly attributable to the synergy among target priors, evidence retrieval and conditional representations, rather than to unbounded text generation.
+
+Let the parameters of the frozen LLM be \(\Theta\), which remain fixed during training. Let the student-side context projector be \(P_{\phi}^{ctx}\), and the target-side projector be \(P_{\psi}^{tar}\), where \(\phi\) and \(\psi\) are trainable parameters. For each prediction sample \((u,t,q_{u,t})\), the projectors map the student-side cognitive context and target-side prior into continuous vector sequences:
+\begin{align}
+Z^{ctx}_{u,t} &= P_{\phi}^{ctx}(x^{ctx}_{u,t}), \\
+Z^{tar}_{t} &= P_{\psi}^{tar}(x^{tar}_{t}).
+\end{align}
+
+Here, \(Z^{ctx}_{u,t}\) denotes context soft slots, and \(Z^{tar}_{t}\) denotes target soft slots. The two types of soft slots have different functions. Context soft slots inject the student's cognitive state under the current target condition, while target soft slots inject the multi-source cognitive prior of the current question. With this design, the prediction module receives structured evidence without expanding the full history as text, and performs binary prediction in the representation space of the frozen LLM.
+
+\subsubsection{Target-Conditioned Soft-Slot Injection}
+
+Soft slots are designed as intermediate representations between structured cognitive features and the frozen LLM. Unlike methods that rewrite historical interactions, retrieved evidence and statistical features into long text and ask the LLM to infer by itself, soft slots encode transfer evidence over seen concepts and the prior of the unseen target as continuous conditional inputs. This design preserves the structure produced by retrieval and context construction, while avoiding length growth, evidence confusion and free-text parsing errors caused by full-history concatenation.
+
+Context soft slots come from the student-side cognitive context features \(x^{ctx}_{u,t}\). This component contains retrieved evidence from the student's historical interactions, evidence roles, support strengths, recent state and risk level. It also contains mastered concepts, weak concepts, transfer state and evidence-quality information derived from the structured cognitive summary. The student-side projector \(P_{\phi}^{ctx}\) maps these heterogeneous features into a fixed-length continuous vector sequence that can enter the embedding input space of the LLM.
+
+The role of context soft slots is not to restate the student's history. It is to provide the prediction module with a cognitive-state condition that has already been selected, compressed and organized. For the same student, different target questions trigger different evidence retrieval results. The corresponding context soft slots therefore vary with the target question, reflecting the target conditionality of KT prediction.
+
+Target soft slots come from the target-side multi-source prior features \(x^{tar}_{t}\). This component contains question text semantics, hierarchical semantic identifier, cognitive-enhanced semantics, collaborative relations and question cognitive attributes. The target-side projector \(P_{\psi}^{tar}\) maps these question priors into a continuous vector sequence that injects the ability requirements and target-side background of the current question into the frozen LLM.
+
+Target soft slots and context soft slots jointly define the prediction condition. The former describes what the current question requires, and the latter describes what state the student exhibits under that target condition.
+
+In the input organization, this paper retains both a textual prompt template and continuous soft slots. The prompt template only states the KT task and candidate label constraints. It does not inject the answer of the target concept or rely on unverified external facts. The soft slots carry the structured cognitive evidence actually used for prediction. The prompt template is not used to concatenate the full history, nor does it require the LLM to select evidence from a long natural-language history.
+
+The conditional information fed into the frozen LLM consists of three parts: task prompt text, context soft slots and target soft slots. The overall input is denoted as
+\[
+I_{u,t}=[T;\,Z^{ctx}_{u,t};\,Z^{tar}_{t}]
+\]
+
+where \(T\) denotes the task instruction and label-constrained prompt, and \(Z^{ctx}_{u,t}\) and \(Z^{tar}_{t}\) denote the student-side and target-side continuous conditional inputs. This input structure jointly injects the KT task constraint, student cognitive state and target-question prior into prediction.
+
+\subsubsection{Label-Constrained Logit Probability Prediction}
+
+This paper models KT over unseen concepts as binary probability estimation under an information boundary, rather than as a natural-language generation task. For input \(I_{u,t}\), the frozen LLM produces vocabulary logits at the candidate label position after the forward pass. The prediction module reads only the logits of the correct and incorrect labels, and uses softmax to obtain the probability that the student answers correctly. The LLM therefore performs conditional discrimination over encoded student evidence and target priors. The output contains no free text that must be parsed.
+
+Here, \(p_{u,t}=P(y_{u,t}=1\mid H_{u,<t},q_{u,t},a(q_{u,t}))\) denotes the theoretical correct-response probability under the pre-target history and observable target-question prior, and \(\hat p_{u,t}\) denotes the model estimate. Let \(o^{+}_{u,t}\) and \(o^{-}_{u,t}\) denote the logits corresponding to the correct and incorrect labels. Then
+\[
+\hat p_{u,t}=f_{\Theta,\phi,\psi}(I_{u,t})=\frac{\exp(o^{+}_{u,t})}{\exp(o^{+}_{u,t})+\exp(o^{-}_{u,t})}.
+\]
+
+The probability of an incorrect response is
+\[
+P(y_{u,t}=0 \mid H_{u,<t}, q_{u,t}) = \frac{\exp(o^{-}_{u,t})}{\exp(o^{+}_{u,t}) + \exp(o^{-}_{u,t})}
+\]
+
+This output form directly matches the probability scores required by KT evaluation. Unlike methods that require the LLM to generate natural-language answers or structured JSON followed by parsing, this paper uses label logits directly for binary probability computation. The predicted result \(\hat{p}_{u,t}\) is used to compute the training loss and to evaluate AUC, ACC, F1 and RMSE during testing.
+
+During training, given the true label \(y_{u,t} \in \{0,1\}\), this paper optimizes the projector parameters with binary cross-entropy loss:
+
+\[
+\mathcal{L} = -\sum_{(u,t)} \left[
+    y_{u,t} \log \hat{p}_{u,t}
+    + (1-y_{u,t}) \log(1-\hat{p}_{u,t})
+\right]
+\]
+
+Under this objective, the frozen LLM parameters \(\Theta\) are not updated. The optimization targets are the student-side context projector parameters \(\phi\) and the target-side projector parameters \(\psi\). Training encourages the projectors to map student-side cognitive context over seen concepts and multi-source priors of unseen targets into a continuous input space suitable for label discrimination.
+
+Because the main LLM remains frozen, task adaptation occurs in the mapping layer from evidence to soft slots. The model must rely on transferable conditional representations, rather than creating concept-specific memory for test concepts by updating LLM parameters.
+
+Through soft-slot injection, the model converts retrieved target-related cognitive evidence into continuous conditional inputs and completes KT prediction in the label space of the frozen LLM. This continuous conditional input design is related to parameter-efficient continuous prompting in frozen language models, including prompt tuning and prefix tuning.
+
+The soft slots in this paper are projected from cognitive evidence features and serve binary label-logit prediction\citep{lester2021power,li2021prefixtuning}. This process preserves the temporal constraints and probabilistic output form of KT, while avoiding the direct delivery of a student's full history to an LLM for unconstrained generation.
+
+\setcounter{section}{3}
+\section{Experiments}
+\subsection{Experimental Setup}
+
+\subsubsection{Datasets and Splits}
+
+This paper evaluates Cognitive-RAG KT on three KT datasets: MOOCRadar~\citep{yu2023moocradar}, XES3G5M~\citep{liu2023xes3g5m} and FoundationalASSIST~\citep{worden2026foundationalassist}. All three datasets are organized into student-question interaction sequences. Each interaction record contains a student identifier, a question identifier, a response outcome and the knowledge concepts associated with the question. The prediction target is the probability that the student answers the target question correctly, given the student's historical interactions and the cognitive prior of the target question.
+
+To align the experimental setting with the method objective, this paper constructs prediction samples around target questions. For student \(u\) at time step \(t\), the target question is \(q_{u,t}\), the historical input is only \(H_{u,<t}\), and the true label is \(y_{u,t} \in \{0,1\}\), where \(y_{u,t}=1\) denotes a correct response and \(y_{u,t}=0\) denotes an incorrect response. The text, concepts, semantic vectors and collaborative vectors of the target question are used to construct the question-side cognitive prior, but the true response outcome of the target question is never used as a prompt or embedding input.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Overall dataset statistics}
+\label{tab:dataset-split-statistics}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Dataset} & \textbf{Students} & \textbf{Questions} & \textbf{Concepts} & \textbf{Interactions}  \\
+\midrule
+MOOCRadar & 14,224 & 9,383 & 9,985 & 898,933  \\
+XES3G5M & 4,833 & 3,903 & 575 & 609,867  \\
+FoundationalASSIST & 5,000 & 2,492 & 143 & 999,467  \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsubsection{Unseen-Concept Inductive Evaluation Protocol}
+
+Cold start in KT is not limited to new students or new questions. It can also occur when knowledge concepts have not appeared during training. This paper treats such cases as an unseen-concept inductive evaluation setting rather than redefining them as a separate task. Each test target is associated with at least one knowledge concept absent from training supervision, and the model therefore cannot rely only on experience from existing concept or question IDs. This setting evaluates whether the model can combine prior learning history with available target-question priors and transfer learned cognitive representations to unseen knowledge concepts.
+
+Specifically, this paper constructs the training and test sets according to the knowledge concepts associated with questions. For a test target \(q_{u,t}\), the associated concept set contains at least one test concept unseen during training, namely \(C(q_{u,t})\cap\mathcal{C}_{\mathrm{test}}\neq\emptyset\). If a question is associated with both seen and unseen concepts, it is included in the test target set as long as it contains any test concept. This protocol therefore evaluates inductive prediction under unseen ability requirements.
+
+During testing, the model uses only the student's historical interactions before the target question, together with the question text, concept information and static attributes available before the response. Difficulty, collaborative relations and graph-structural statistics that depend on response records are generated from training interactions and frozen during testing.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Split statistics for unseen-concept inductive evaluation}
+\label{tab:cold-start-split-statistics}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Dataset} & \textbf{Train interactions} & \textbf{Test interactions} & \textbf{Train concepts} & \textbf{Test concepts} & \textbf{Unseen test concepts} \\
+\midrule
+FoundationalASSIST & 328,433 & 666,034 & 27 & 127 & 113 (89.0\%) \\
+XES3G5M & 108,319 & 496,715 & 99 & 524 & 476 (90.8\%) \\
+MOOCRadar & 66,512 & 818,197 & 138 & 2,703 & 2,642 (97.7\%) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+Table~\ref{tab:cold-start-split-statistics} shows that all test targets in the three datasets contain at least one concept unseen during training, and that unseen concepts account for a large proportion of the test concepts. To keep the evaluation boundary consistent, question difficulty, collaborative relations and graph-structural statistics derived from response records are estimated only from training interactions. Test labels, test interactions and their derived statistics do not participate in question-prior construction or model selection.
+
+\subsubsection{Compared Models}
+
+The main experiments compare existing KT baselines with the proposed method. Results are reported only for models evaluated on the same data splits and the same test samples. External baselines include representative models such as DKT~\citep{piech2015deep}, SAKT~\citep{pandey2019sakt}, SAINT~\citep{choi2020saint}, AKT~\citep{ghosh2020akt}, DIMKT~\citep{shen2022dimkt} and QIKT~\citep{chen2023qikt}.
+
+The comparison also includes TCKT~\citep{huang2024tckt}, SimpleKT~\citep{liu2023simplekt}, SparseKT~\citep{huang2023sparsekt}, DenoiseKT~\citep{deng2025denoisekt}, RobustKT~\citep{guo2025robustkt} and KeenKT~\citep{li2026keenkt}. Model categories and input information are provided in Appendix Table~\ref{tab:appendix-comparison-models}.
+
+Traditional KT baselines mainly predict from student historical interaction sequences and do not use the cognitive evidence retrieved by Cognitive-RAG. Cognitive-RAG KT uses question-side multi-source cognitive priors and student-side cognitive context features. The latter contain retrieved evidence, structured evidence attributes and structured cognitive summary-derived features. The model projects these multi-source signals into soft slots, feeds them into a frozen Qwen3-8B model\citep{yang2025qwen3,qwen2025qwen38b}, and reads label logits followed by a binary softmax to obtain \(\hat{p}_{u,t}\). It does not predict through free-text generation.
+
+The comparison therefore does not require all models to receive fully identical input information. Its focus is to evaluate, under the same data split and test targets, how different modeling paradigms adapt to unseen-concept inductive prediction. The interpretation of results is accordingly limited to whether combining cognitive retrieval evidence with the representation space of a frozen LLM improves KT probability prediction.
+
+\subsubsection{Implementation Details}
+
+The method sequentially performs target-conditioned cognitive evidence retrieval, hierarchical cognitive context construction, structured cognitive summary generation, soft-slot feature transformation and probability prediction. Candidate evidence is recalled through knowledge, semantic, collaborative and graph-structural relations of the target question, and is reranked with relevance, coverage and redundancy control. The structured cognitive summary compresses retrieved evidence into fields such as mastered concepts, weak concepts, transfer state, risk level and evidence quality, and enters the projector as part of the student-side context features.
+
+The prediction module uses a frozen Qwen3-8B and trains only the student-side and target-side projectors. The main experiments use both context soft slots and target soft slots, and compute \(\hat{p}_{u,t}\) through a binary softmax over label logits\citep{yang2025qwen3,qwen2025qwen38b,qwen2025qwen3embedding,qwen2025qwen3reranker}. Complete retrieval settings, the structured cognitive summary schema, the soft-slot prediction configuration and the training configuration are given in Appendix Table~\ref{tab:appendix-main-method-config}.
+
+\subsection{Main Experimental Results and Analysis}
+
+Table~\ref{tab:main-results} reports the main experimental results of Cognitive-RAG KT and the KT baselines on the three datasets. To avoid confusion with direct prompt-based LLM methods, this paper consistently refers to the proposed method as Cognitive-RAG KT. This section analyzes only the main results and does not attribute the overall performance difference to a specific submodule. Component contributions are discussed separately in the ablation experiments.
+
+\begin{landscape}
+\begin{table}[p]
+\centering
+\caption{Main experimental results}
+\label{tab:main-results}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccccccccc}
+\toprule
+\multirow{2}{*}{\textbf{Method}} & \multicolumn{4}{c}{\textbf{FoundationalASSIST}} & \multicolumn{4}{c}{\textbf{XES3G5M}} & \multicolumn{4}{c}{\textbf{MOOCRadar}} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}\cmidrule(lr){10-13}
+ & \textbf{AUC} & \textbf{ACC} & \textbf{F1} & \textbf{RMSE} & \textbf{AUC} & \textbf{ACC} & \textbf{F1} & \textbf{RMSE} & \textbf{AUC} & \textbf{ACC} & \textbf{F1} & \textbf{RMSE} \\
+\midrule
+DKT & 0.5053 & 0.5053 & 0.5621 & 0.5085 & 0.5006 & 0.5013 & 0.6125 & 0.5100 & 0.4830 & 0.4932 & 0.6062 & 0.5161 \\
+SAKT & 0.5974 & 0.5902 & 0.6667 & 0.5396 & 0.5636 & 0.7011 & 0.8127 & 0.4960 & 0.7090 & 0.7779 & 0.8666 & 0.4103 \\
+SAINT & 0.6184 & 0.6226 & 0.7144 & 0.4857 & 0.5692 & 0.7831 & 0.8773 & 0.4211 & 0.6637 & 0.7024 & 0.8107 & 0.4476 \\
+AKT & 0.6430 & 0.6360 & 0.7195 & 0.4855 & 0.6065 & 0.7503 & 0.8504 & 0.4235 & 0.7357 & 0.8099 & 0.8895 & 0.3716 \\
+DIMKT & 0.6250 & 0.6388 & 0.7414 & 0.4839 & 0.5771 & 0.7607 & 0.8601 & 0.4228 & 0.7385 & 0.8345 & 0.9066 & 0.3518 \\
+QIKT & 0.6250 & 0.6378 & 0.7377 & 0.4857 & 0.6049 & 0.7712 & 0.8670 & 0.4154 & 0.7806 & 0.8371 & 0.9081 & 0.3444 \\
+TCKT & 0.6011 & 0.5967 & 0.6760 & 0.5130 & 0.6004 & 0.7635 & 0.8613 & 0.4193 & 0.7702 & 0.8220 & 0.8965 & 0.3559 \\
+SimpleKT & 0.5981 & 0.5625 & 0.6158 & 0.5367 & 0.5726 & 0.7312 & 0.8363 & 0.4431 & 0.7582 & 0.8207 & 0.8953 & 0.3596 \\
+SparseKT & 0.6067 & 0.6067 & 0.6918 & 0.5109 & 0.5810 & 0.7338 & 0.8381 & 0.4407 & 0.7387 & 0.8180 & 0.8941 & 0.3668 \\
+DenoiseKT & 0.6557 & 0.6469 & 0.7340 & 0.4694 & 0.6384 & 0.7839 & 0.8768 & 0.4028 & 0.7817 & 0.8391 & 0.9094 & 0.3415 \\
+RobustKT & 0.6252 & 0.6098 & 0.6835 & 0.4903 & 0.5745 & 0.7413 & 0.8448 & 0.4392 & 0.7448 & 0.8297 & 0.9029 & 0.3555 \\
+KeenKT & 0.6246 & 0.6226 & 0.7054 & 0.4824 & 0.6232 & 0.7612 & 0.8577 & 0.4182 & 0.7758 & 0.8067 & 0.8849 & 0.3664 \\
+\textbf{Cognitive-RAG KT} & \textbf{0.7805} & \textbf{0.7335} & \textbf{0.7998} & \textbf{0.4239} & \textbf{0.7542} & \textbf{0.8046} & \textbf{0.8873} & \textbf{0.3791} & \textbf{0.8404} & \textbf{0.8521} & \textbf{0.9111} & \textbf{0.3322} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+\end{landscape}
+
+\begin{figure}[H]
+\centering
+\includesvg[inkscapelatex=false,width=0.98\textwidth]{figures/fig2_paired_bootstrap_deltas_v2}
+\caption{Paired bootstrap differences between Cognitive-RAG KT and the strongest baseline, DenoiseKT. Positive values indicate that Cognitive-RAG KT outperforms DenoiseKT. RMSE is reported as error reduction. Error bars denote 95\% confidence intervals.}
+\label{fig:paired-bootstrap-deltas}
+\end{figure}
+
+As Table~\ref{tab:main-results} shows, Cognitive-RAG KT achieves the best AUC, ACC, F1 and RMSE on MOOCRadar, XES3G5M and FoundationalASSIST. The AUC values of the main model on the three test sets are 0.8404, 0.7542 and 0.7805, respectively. Their bootstrap 95\% confidence intervals are [0.8393, 0.8416], [0.7525, 0.7559] and [0.7793, 0.7816], indicating stable probability-ranking performance over large-scale unseen-concept test samples.
+
+Figure~\ref{fig:paired-bootstrap-deltas} further reports paired bootstrap differences between the proposed method and DenoiseKT, the strongest baseline on each dataset. The differences in AUC, ACC and F1, and the reductions in RMSE, are positive on all three datasets. The corresponding 95\% confidence intervals do not cross zero. These results indicate that, on the same unseen-concept test targets, Cognitive-RAG KT achieves higher point estimates than the strong sequential baseline and shows a statistically stable relative advantage.
+
+The gain pattern differs across datasets. The AUC gain is largest on FoundationalASSIST. On XES3G5M, both AUC and threshold-based metrics improve steadily. On MOOCRadar, although the positive-class ratio is high, the proposed method maintains clear advantages in AUC and RMSE. Across the three datasets, the gain should not be interpreted simply as an effect of adding more input information. It is better understood as an improvement in conditional discrimination over unseen concept targets after question-side priors and student pre-target histories are organized as structured evidence for the current prediction.
+
+\subsection{Unseen-Concept Test Slice Analysis}
+
+To further check that the main results are not driven by mixed-concept samples or a small number of easy targets, this paper conducts unseen-concept slice analysis on the test sets. Figure~\ref{fig:unseen-slice-results} divides test targets into pure unseen-concept samples and mixed seen-and-unseen concept samples, and examines whether model performance mainly comes from targets that contain seen concepts. Pure unseen samples refer to target questions whose associated concepts are all outside the training concept set. Mixed samples refer to target questions that contain both training-stage seen concepts and unseen concepts.
+
+\begin{figure}[H]
+\centering
+\includesvg[inkscapelatex=false,width=0.98\textwidth]{figures/fig4_unseen_slice_composite_v2}
+\caption{Performance and sample composition for unseen-concept test slices. The left and middle panels compare AUC and RMSE on pure unseen-concept samples and mixed seen-and-unseen concept samples, where lower RMSE is better. The right panel reports the sample proportion of each test slice.}
+\label{fig:unseen-slice-results}
+\end{figure}
+
+The slice results show that pure unseen-concept samples account for 96.4\%, 94.5\% and 69.8\% of FoundationalASSIST, XES3G5M and MOOCRadar, respectively. On pure unseen samples, Cognitive-RAG KT achieves AUC values of 0.7810, 0.7540 and 0.8439, which are close to the full unseen-concept test results. The model also maintains comparable ranking performance on mixed seen-and-unseen samples. These results indicate that the main model performance is not mainly driven by mixed samples that contain seen concepts. It remains stable on the stricter pure unseen-concept targets.
+
+In addition to unseen-concept slices, this paper uses history length, number of retrieved evidence items, semantic distance, test concept frequency and graph connectivity as descriptive diagnostic dimensions. To avoid overloading the main text, fine-grained stratified results are placed in the appendix. The reported ranges denote the minimum and maximum AUC values across buckets, rather than confidence intervals. See Appendix Figure~\ref{fig:stratified-auc-ranges}.
+
+\subsection{Ablation Design and Analysis}
+
+The ablation experiments focus on three key components that can be directly mapped to the current results: target-conditioned cognitive evidence retrieval, structured cognitive summary and structured evidence. The full model retains all three components. Each variant removes only the component indicated by its name, while keeping the remaining input and prediction pipeline unchanged.
+
+To avoid confounding component comparison with sample-selection differences, all variants run on the same fixed evaluation manifest. The manifest uses the \texttt{sample\_id} corresponding to the triplet \((u,t,q_{u,t})\) to align the student, target time step, target question and test label. It is used only to fix evaluation samples and compute metrics, and it does not participate in evidence generation or probability prediction. Variant definitions and the shared evaluation protocol are given in Appendix Table~\ref{tab:appendix-ablation-design}. Here, structured cognitive summary refers to constrained summary fields and derived features generated by the frozen LLM, not to an open-ended label-generation process.
+
+\subsubsection{Key-Component Ablation Results}
+
+Table~\ref{tab:ablation_study} reports the results after removing target-conditioned cognitive evidence retrieval, structured cognitive summary and structured evidence. The full model retains all three components. The other settings remove only the component indicated by the variant name, and the full model serves as the within-table comparison reference. Because the full-model numbers in this table differ from those in the main result table, the ablation results are used only for relative comparison under the fixed protocol and should not be directly compared with the absolute values in Table~\ref{tab:main-results}.
+
+\begin{landscape}
+\begin{table}[H]
+\centering
+\caption{Key-component ablation results on three public education datasets}
+\label{tab:ablation_study}
+\small
+\setlength{\tabcolsep}{5pt}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lcccccccccccc}
+\toprule
+\multirow{2}{*}{\textbf{Component setting}}
+& \multicolumn{4}{c}{\textbf{FoundationalASSIST}}
+& \multicolumn{4}{c}{\textbf{XES3G5M}}
+& \multicolumn{4}{c}{\textbf{MOOCRadar}} \\
+\cmidrule(lr){2-5}
+\cmidrule(lr){6-9}
+\cmidrule(lr){10-13}
+& AUC & ACC & F1 & RMSE
+& AUC & ACC & F1 & RMSE
+& AUC & ACC & F1 & RMSE \\
+\midrule
+Full model
+& \textbf{0.7022} & \textbf{0.6830} & 0.7602 & \textbf{0.4972}
+& \textbf{0.6627} & 0.7834 & 0.8745 & \textbf{0.4338}
+& \textbf{0.7500} & 0.8172 & \textbf{0.8976} & 0.4062 \\
+
+Remove target-conditioned cognitive evidence retrieval
+& 0.6532 & 0.6409 & 0.7302 & 0.5170
+& 0.6120 & 0.7320 & 0.8366 & 0.4606
+& 0.5974 & 0.7234 & 0.8303 & 0.4660 \\
+
+Remove structured cognitive summary
+& 0.6990 & 0.6810 & 0.7668 & 0.4997
+& 0.6571 & \textbf{0.7837} & 0.8750 & 0.4363
+& 0.7375 & \textbf{0.8178} & 0.8964 & \textbf{0.3983} \\
+
+Remove structured evidence
+& 0.6784 & 0.6600 & \textbf{0.7703} & 0.5311
+& 0.6375 & 0.7815 & \textbf{0.8752} & 0.4367
+& 0.6873 & 0.8115 & 0.8938 & 0.4041 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+\end{landscape}
+
+\begin{figure}[H]
+\centering
+\includesvg[inkscapelatex=false,width=0.92\textwidth]{figures/fig3_ablation_auc_effects_v2}
+\caption{AUC differences in key-component ablations. Each point denotes the \(\Delta\)AUC between the full model and the corresponding component-removal variant. Error bars denote paired bootstrap 95\% confidence intervals.}
+\label{fig:ablation-auc-effects}
+\end{figure}
+
+Figure~\ref{fig:ablation-auc-effects} further reports AUC differences between the full model and each removal variant, together with paired bootstrap confidence intervals. In terms of AUC, after removing target-conditioned cognitive evidence retrieval, the full model outperforms the variant by 0.0458, 0.0451 and 0.1526 on FoundationalASSIST, XES3G5M and MOOCRadar, respectively. The 95\% confidence intervals are all positive. These results show that, under the current ablation setting, target-conditioned cognitive evidence retrieval is the most stable source of probability-ranking contribution across the three datasets, with a particularly large effect on MOOCRadar.
+
+Removing structured evidence also leads to stable AUC decreases, with differences of 0.0207, 0.0196 and 0.0627 across the three datasets. This indicates that structured information such as evidence role, support strength and relation source provides additional support for target-conditioned prediction. In contrast, the AUC decrease after removing the structured cognitive summary is smaller, showing that summary information benefits probability ranking but contributes less than target-conditioned cognitive evidence retrieval and structured evidence.
+
+These results indicate that the main gain of the full model does not come from allowing the LLM to summarize or generate judgments by itself. It comes primarily from target-conditioned cognitive evidence retrieval and structured evidence organization. The structured cognitive summary is better interpreted as auxiliary compression of retrieved evidence. Some threshold-based metrics and error metrics show directions that are not fully consistent in a few variants. Therefore, this paper limits the ablation conclusion to the following claim: target-conditioned cognitive evidence retrieval is the most stable contributor to AUC, structured evidence provides secondary support, and structured cognitive summaries provide a smaller complementary gain. No component is interpreted as uniformly effective on all metrics.
+
+Because the ablation experiments require repeated evidence construction, retrieval and frozen-LLM inference, this paper compares key components on a fixed test target subset. All ablation variants share the same training data and test target set to ensure comparability. The main experiments are still reported on the full test sets, while the ablation experiments analyze the relative contribution of different components.
+
+\section{Conclusion}
+
+This paper proposes Cognitive-RAG KT for inductive KT over knowledge concepts unseen during training. The core idea is not to expand the amount of historical input. Instead, the model selects transferable cognitive evidence from a student's pre-target history conditioned on the target question, maps the hierarchical cognitive context, structured cognitive summary-derived features and target-side prior into soft slots, injects them into a frozen LLM, and outputs the probability of a correct response from label logits.
+
+Experiments show that Cognitive-RAG KT outperforms multiple KT baselines under unseen-concept inductive evaluation. Pure unseen-concept slice analysis shows that its performance is not mainly driven by mixed samples containing seen concepts. Key-component ablations further show that target-conditioned cognitive evidence retrieval is the most stable source of contribution, structured evidence provides secondary support, and structured cognitive summaries provide auxiliary compressed information. The main conclusion is that, for KT over concepts unseen during training, explicitly selecting and organizing transferable cognitive evidence from the student's pre-target history provides more effective information for the frozen LLM's probability discrimination than target-agnostic compression of historical sequences.
+
+\section{Limitations and Future Work}
+
+Although Cognitive-RAG KT achieves stable overall improvements on three public datasets, several boundaries require further study. First, the current experiments support the effectiveness of target-conditioned cognitive evidence retrieval through overall comparison, slice analysis, stratified analysis and component ablation, but they do not fully characterize the cognitive credibility of retrieved evidence. A performance gain does not necessarily mean that the evidence is sufficient, necessary or causally valid in pedagogical cognition. Future work can introduce evidence masking, counterfactual evidence replacement, retrieval perturbation, expert evaluation and evidence-consistency analysis to test whether the historical interactions used by the model genuinely support the current prediction, rather than reflecting surface correlations from question similarity, concept frequency or dataset bias.
+
+Second, the structured cognitive summary is a constrained compression of retrieved evidence, not an independently validated cognitive diagnosis. This paper uses it only as student-side context features and summary-derived features, and evaluates its predictive contribution through ablation. Whether the summary fields align with teacher judgments, student error causes or future learning gains still requires manual annotation, expert evaluation or intervention studies.
+
+Third, this paper limits KT to correct-response probability prediction under pre-target history and evaluates it mainly with offline metrics such as AUC, ACC, F1, RMSE and BCE. This setting tests predictive ability, but it is insufficient to show whether the model output can directly support instructional intervention.
+
+Future work should further examine probability calibration, stability on low-frequency concepts and new-student scenarios, and the relation between model outputs and learning gains, error-cause diagnosis and personalized intervention. For LLM-based KT methods, reporting offline prediction improvement alone remains insufficient. The more important question is whether the cognitive evidence used and presented by the model is verifiable, traceable and useful to teachers.
+
+Fourth, the frozen LLM improves the conditional representation and probability discrimination capability of the structured cognitive context, but it also substantially increases inference cost. Direct deployment on large-scale online learning platforms therefore remains constrained. Future work can explore evidence caching, soft-slot distillation, lightweight student-model substitution, retrieval-candidate precomputation and joint retriever-predictor compression.
+
+Further work also needs to systematically analyze the performance-cost trade-off among retrieval scale, slot count, LLM parameter size and inference latency. Only by reducing deployment cost while preserving prediction performance and evidence credibility can Cognitive-RAG KT move from an offline experimental framework toward real educational systems.
+
+\clearpage
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\clearpage
+\appendix
+\section{Appendix}
+\label{app:experiment-details}
+
+This appendix supplements the evaluation protocol, main-model confidence intervals, stratified result ranges, baseline model settings, method configuration, ablation design and computing environment that are not expanded in the main text. To keep the main text concise, the appendix retains only information needed for reproducibility and review. Script entry points, fields and intermediate manifests are listed only where necessary, such as in the ablation protocol.
+
+\subsection{Additional Details on the Evaluation Protocol}
+
+The unseen-concept inductive evaluation is based on the concepts associated with questions. All test targets contain at least one concept unseen during training. Question difficulty, collaborative relations and graph-structural statistics derived from student response records are estimated only from training interactions. Test labels are used only for metric computation and do not participate in question-prior construction, evidence selection or model selection.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Additional details on the unseen-concept evaluation protocol}
+\label{tab:appendix-audit-summary}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llll}
+\toprule
+\textbf{Dataset} & \textbf{Test target constraint} & \textbf{Behavioral statistics source} & \textbf{Target label usage} \\
+\midrule
+FoundationalASSIST & Contains at least one training-unseen concept & Estimated only from training interactions & Used only for metric computation \\
+XES3G5M & Contains at least one training-unseen concept & Estimated only from training interactions & Used only for metric computation \\
+MOOCRadar & Contains at least one training-unseen concept & Estimated only from training interactions & Used only for metric computation \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Main-Model Confidence Intervals and Additional Stratified Results}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Main-model metrics and bootstrap confidence intervals for Cognitive-RAG KT}
+\label{tab:appendix-main-ci}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Dataset} & \textbf{Samples} & \textbf{AUC} & \textbf{ACC} & \textbf{F1} & \textbf{RMSE} \\
+\midrule
+FoundationalASSIST & 666,034 & 0.7805 [0.7793, 0.7816] & 0.7335 [0.7324, 0.7345] & 0.7998 [0.7989, 0.8007] & 0.4239 [0.4233, 0.4245] \\
+XES3G5M & 496,715 & 0.7542 [0.7525, 0.7559] & 0.8046 [0.8035, 0.8058] & 0.8873 [0.8866, 0.8880] & 0.3791 [0.3781, 0.3800] \\
+MOOCRadar & 818,197 & 0.8404 [0.8393, 0.8416] & 0.8521 [0.8513, 0.8528] & 0.9111 [0.9107, 0.9116] & 0.3322 [0.3314, 0.3328] \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\includesvg[inkscapelatex=false,width=0.98\textwidth]{figures/figs1_stratified_auc_ranges_v2}
+\caption{Minimum-to-maximum AUC ranges across stratification dimensions. Cell colors indicate the AUC span across buckets within the same stratification dimension, and cell text reports the minimum and maximum values. The range is descriptive and does not denote a confidence interval.}
+\label{fig:stratified-auc-ranges}
+\end{figure}
+
+The ranges in Figure~\ref{fig:stratified-auc-ranges} are the minimum and maximum values across buckets within the same stratification dimension. They describe performance variation under different test conditions and do not denote confidence intervals.
+
+\subsection{Input Information of Compared Models}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Categories and input information of compared models}
+\label{tab:appendix-comparison-models}
+\begin{tabularx}{\textwidth}{p{2.6cm}p{3.3cm}X}
+\toprule
+\textbf{Model} & \textbf{Type} & \textbf{Input information} \\
+\midrule
+DKT & Recurrent neural KT & Student historical questions, knowledge concepts and response sequences; no additional cognitive context \\
+SAKT & Self-attentive KT & Student historical interaction sequence and current target question; no additional cognitive context \\
+SAINT & Transformer KT & Question sequence and response sequence; no additional cognitive context \\
+AKT & Attention and cognitive measurement KT & Student historical interaction sequence and question or concept representation; no additional cognitive context \\
+DIMKT & Difficulty-aware KT & Student historical interaction sequence and question-difficulty information; no Cognitive-RAG evidence \\
+QIKT & Question-level KT & Student historical interaction sequence and question-level representation; no Cognitive-RAG evidence \\
+TCKT & Temporal or causal enhanced KT & Student historical interaction sequence and its temporal relations; no additional cognitive context \\
+SimpleKT & Simplified attention KT & Student historical interaction sequence; no additional cognitive context \\
+SparseKT & Sparse attention KT & Student historical interaction sequence; no additional cognitive context \\
+DenoiseKT & Denoising KT & Student historical interaction sequence and denoising mechanism; no Cognitive-RAG evidence \\
+RobustKT & Robust KT & Student historical interaction sequence; no additional cognitive context \\
+KeenKT & Recent KT model & Student historical interaction sequence; no additional cognitive context \\
+Cognitive-RAG KT & Proposed method & Student historical interactions, target-conditioned cognitive evidence, structured cognitive summaries, question-side cognitive priors and soft slots \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Cognitive-RAG KT Model Configuration}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Key model configuration of Cognitive-RAG KT}
+\label{tab:appendix-main-method-config}
+\begin{tabularx}{\textwidth}{p{3.8cm}X}
+\toprule
+\textbf{Item} & \textbf{Setting} \\
+\midrule
+Language model backbone & Qwen3-8B, with main parameters frozen \\
+Prediction method & Reads label logits and computes \(\hat{p}_{u,t}\) through binary softmax \\
+Soft-slot mode and count & context-target; 4 student-side context soft slots and 2 target-question-side target soft slots \\
+Student-side input features & Target-conditioned context embedding, structured cognitive summary embedding, summary-derived structural features and student-side numerical state features \\
+Target-question-side input features & Question text semantic vector, hierarchical semantic ID vector, cognitive-enhanced semantic vector and collaborative question vector \\
+Structured cognitive summary schema & Output is a single JSON object with fixed top-level fields \texttt{mastered\_concepts}, \texttt{weak\_concepts}, \texttt{transfer\_state}, \texttt{risk\_level}, \texttt{evidence\_quality} and \texttt{diagnosis}. The \texttt{mastered\_concepts} and \texttt{weak\_concepts} fields contain at most 3 items each, and each item contains \texttt{concept}, \texttt{evidence\_ids} and \texttt{confidence}. Risk level, evidence quality and confidence are restricted to low, medium and high. \\
+Summary generation constraints & The summary prompt requires JSON only, with no explanation, reasoning trace or Markdown. The implementation uses a chat-completion-compatible JSON object response format, temperature 0.0 and maximum output length of 256 tokens. It validates field completeness, enum values, evidence IDs and diagnosis length. Invalid output triggers at most three retries. If the output remains invalid, no summary field is written. \\
+Summary encoding method & A valid summary is rewritten into short text channels for stable mastery, weak risk, diagnostic statement and auxiliary state, and forms a summary-side embedding. The model also constructs 11-dimensional \texttt{llm\_struct\_features}, including the number of mastered concepts, number of weak concepts, mastered and weak presence indicators, normalized diagnosis length, risk-level one-hot features and evidence-quality one-hot features. The summary embedding and structural features are merged into the input of the student-side context projector. \\
+Projector setting & Hidden dimension 512 and dropout 0.1 \\
+Raw long-text input & The full historical long text is not fed directly into the LLM by default; only projected soft slots are used \\
+Retrieval and reranking setting & History window 20, first-stage candidate count 30, final evidence count 6, reranking candidate count 30 and reranking weight 0.5 \\
+Training setting & Fixed random seed 42; frozen LLM; only the projectors in the soft-slot probability prediction module are trained \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Training Hyperparameters of Compared Models}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Training protocol and model hyperparameters of compared models}
+\label{tab:appendix-baseline-training-protocol}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrl}
+\toprule
+\textbf{Model} & \textbf{Epochs} & \textbf{Batch size} & \textbf{Learning rate} & \textbf{Maximum sequence length} & \textbf{Main architecture parameters} \\
+\midrule
+DKT & 100 & 256 & 0.001 & 100 & emb=100, hidden=100 \\
+SAKT & 100 & 256 & 0.001 & 100 & d=100, heads=5, dropout=0.2 \\
+SAINT & 100 & 256 & 0.001 & 100 & d=30, heads=5, dropout=0.6 \\
+AKT & 100 & 256 & 0.001 & 100 & d\_model=100, heads=5, dropout=0.2 \\
+DIMKT & 100 & 256 & 0.001 & 100 & emb=100, dropout=0.2 \\
+QIKT & 100 & 256 & 0.001 & 100 & emb=100, dropout=0.2 \\
+TCKT & 100 & 256 & 0.001 & 512 & d\_model=100, heads=5, dropout=0.2 \\
+SimpleKT & 100 & 256 & 0.001 & 512 & d\_model=100, heads=5, dropout=0.2 \\
+SparseKT & 100 & 256 & 0.001 & 512 & d\_model=100, heads=5, sparse\_ratio=0.8 \\
+DenoiseKT & 100 & 256 & 0.001 & 512 & d\_model=100, dropout=0.2, dropout1=0.1 \\
+RobustKT & 100 & 256 & 0.001 & 100 & d\_model=100, heads=5, dropout=0.2 \\
+KeenKT & 100 & 256 & 0.0001 & 512 & d\_model=256, heads=8, dropout=0.2 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Key-Component Ablation Protocol}
+
+Table~\ref{tab:appendix-ablation-design} defines the variants in Table~\ref{tab:ablation_study}. All variants share the same training data, the same random seed and the same fixed test target subset. Paired bootstrap analysis is performed on 50,000 target samples for each dataset. The main experiments are still reported on the full test sets, so the ablation table is used only for relative component comparison under the fixed protocol.
+
+The fixed test target subset is exported from the main-experiment test prediction file as an evaluation manifest. The entry point is \texttt{scripts/build\_llm\_ablation\_eval\_manifest.py}. Each line in the manifest uses the \texttt{sample\_id} corresponding to \((u,t,q_{u,t})\) as the unique key, and records the dataset name, test split, student ID, target time step, target question ID and true label.
+
+If a sampling size is specified, the manifest uses label-stratified random sampling with default random seed 42. If the sampling size is 0, all test rows are retained. After generation, the metadata records the source prediction file, source test sample count, selected sample count, sampling strategy, random seed, positive and negative label counts, and manifest SHA-256.
+
+Subsequent ablation runs read this fixed manifest through \texttt{scripts/run\_llm\_ablation\_experiments.py} and do not use new \texttt{sample\_size}, \texttt{max\_samples} or offset parameters. The run configuration records \texttt{eval\_manifest\_jsonl}, variant names, loaded sample count and selected label distribution, and checks that manifest labels are consistent with target labels in the student data. This protocol ensures that differences among variants in Table~\ref{tab:ablation_study} come from the removed components rather than from changes in test targets or label composition.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Key-component ablation settings}
+\label{tab:appendix-ablation-design}
+\begin{tabularx}{\textwidth}{p{3.3cm}XXX}
+\toprule
+\textbf{Variant} & \textbf{Target-conditioned cognitive evidence retrieval} & \textbf{Structured cognitive summary} & \textbf{Structured evidence} \\
+\midrule
+Full model & Retained & Retained & Retained \\
+Remove target-conditioned cognitive evidence retrieval & Removed & Retained & Retained \\
+Remove structured cognitive summary & Retained & Removed & Retained \\
+Remove structured evidence & Retained & Retained & Removed \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Computing Environment}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Experimental computing environment}
+\label{tab:appendix-experiment-environment}
+\begin{tabular}{ll}
+\toprule
+\textbf{Item} & \textbf{Configuration} \\
+\midrule
+GPU & 6 $\times$ NVIDIA GeForce RTX 4090 \\
+CPU and memory & Intel Xeon Platinum 8350C, 503 GiB RAM \\
+Operating system & Ubuntu 22.04.5 LTS \\
+Main software environment & Python 3.11.15, PyTorch 2.6.0+cu124, Transformers 4.51.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
